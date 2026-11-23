@@ -12,9 +12,9 @@ using System.Windows.Forms;
 
 static class AppInfo
 {
-    public const string Version = "1.1.1";
+    public const string Version = "1.1.2";
     // 改成你自己的 GitHub 仓库，格式：用户名/仓库名
-    public const string Repo = "lotusVienna/Launcher";
+    public const string Repo = "YOUR_GITHUB_NAME/Launcher";
 }
 
 class Item

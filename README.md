@@ -28,7 +28,7 @@ Windows 10 / 11，使用系统自带的 .NET Framework 4.x，单文件 exe，无
 ## 自行编译
 
 ```
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /codepage:65001 /out:Launcher.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll Launcher.cs
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /codepage:65001 /win32icon:Launcher.ico /out:Launcher.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll Launcher.cs
 ```
 
 ## 上传 GitHub 与发布

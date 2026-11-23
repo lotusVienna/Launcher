@@ -1,1 +1,26 @@
+name: Build & Release
 
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile
+        shell: pwsh
+        run: |
+          & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /codepage:65001 /out:Launcher.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll Launcher.cs
+          if (-not (Test-Path Launcher.exe)) { throw "build failed" }
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Launcher.exe
+          generate_release_notes: true

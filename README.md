@@ -52,4 +52,4 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /codepage
 ## 注意事项
 
 - “关闭”使用 `taskkill /T /F` 强制结束，被关闭的脚本没有机会做收尾
-- 未配置 `AppInfo.Repo`（仍是 `YOUR_...`）时，更新功能会提示先配置，且不会自动检查
+- 未配置 `AppInfo.Repo`（仍是 `YOUR_...` 占位符）时，更新功能会提示先配置，且不会自动检查

@@ -12,9 +12,9 @@ using System.Windows.Forms;
 
 static class AppInfo
 {
-    public const string Version = "1.1.2";
+    public const string Version = "1.1.3";
     // 改成你自己的 GitHub 仓库，格式：用户名/仓库名
-    public const string Repo = "YOUR_GITHUB_NAME/Launcher";
+    public const string Repo = "lotusVienna/Launcher";
 }
 
 class Item
@@ -482,7 +482,7 @@ class LauncherForm : Form
         if (updating) return;
         if (AppInfo.Repo.StartsWith("YOUR_", StringComparison.Ordinal))
         {
-            if (!silent) MessageBox.Show("尚未配置 GitHub 仓库：请修改源码中 AppInfo.Repo 后重新编译。", "检查更新");
+            if (!silent) MessageBox.Show("更新功能暂不可用：程序未设置更新来源。", "检查更新");
             return;
         }
         updBtn.Enabled = false; updBtn.Text = "检查中…";

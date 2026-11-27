@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -12,17 +13,19 @@ using System.Windows.Forms;
 
 static class AppInfo
 {
-    public const string Version = "1.1.3";
-    // 改成你自己的 GitHub 仓库，格式：用户名/仓库名
+    public const string Version = "1.2.0";
+    // GitHub 仓库，格式：用户名/仓库名
     public const string Repo = "lotusVienna/Launcher";
 }
+
+enum Edge { Left, Right, Top, Bottom }
 
 class Item
 {
     public string Name, Path;
     public List<Process> Procs = new List<Process>();   // 同一项可同时运行多个实例
     public Panel Row;
-    public Label Dot, NameLbl, PathLbl;
+    public Label Dot, NameLbl;
     public Button Start, Stop;
 
     public int Count
@@ -40,14 +43,76 @@ class Item
     }
 }
 
+// ================= 弹出的小列表 =================
+class ListForm : Form
+{
+    public Panel Host = new Panel();
+    public Label Empty = new Label();
+
+    public ListForm()
+    {
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        TopMost = true;
+        StartPosition = FormStartPosition.Manual;
+        BackColor = Color.White;
+        Padding = new Padding(1);
+        Font = new Font("Microsoft YaHei UI", 9f);
+        Size = new Size(260, 80);
+
+        Host.Dock = DockStyle.Fill;
+        Host.AutoScroll = true;
+        Host.BackColor = Color.White;
+        Controls.Add(Host);
+
+        Empty.Text = "还没有项目\n把文件拖到小方块上，\n或在托盘菜单里选“添加项目”";
+        Empty.TextAlign = ContentAlignment.MiddleCenter;
+        Empty.ForeColor = Color.FromArgb(110, 118, 129);
+        Empty.Dock = DockStyle.Fill;
+        Empty.Font = new Font("Microsoft YaHei UI", 8.5f);
+        Host.Controls.Add(Empty);
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ClassStyle |= 0x20000;   // 阴影
+            cp.ExStyle |= 0x80;         // 不出现在 Alt+Tab
+            return cp;
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        using (var pen = new Pen(Color.FromArgb(214, 218, 224)))
+            e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+    }
+}
+
+// ================= 桌面常驻小方块（主窗体） =================
 class LauncherForm : Form
 {
-    // ---------- 单实例：唤出已有窗口 ----------
+    // ---------- 单实例：唤出列表 ----------
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern uint RegisterWindowMessage(string msg);
     [DllImport("user32.dll")]
     static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     static readonly uint WM_SHOWME = RegisterWindowMessage("Lofla.Launcher.ShowMe");
+
+    // ---------- 全屏检测 ----------
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")]
+    static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+    [DllImport("user32.dll")]
+    static extern int GetWindowLong(IntPtr h, int idx);
 
     public static void NotifyExisting()
     {
@@ -56,13 +121,32 @@ class LauncherForm : Form
 
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == (int)WM_SHOWME) { ShowWindow_(); return; }
+        if (m.Msg == (int)WM_SHOWME)
+        {
+            if (!Visible) { Show(); }
+            shown = true; leaveTick = 0;
+            ShowList();
+            return;
+        }
         base.WndProc(ref m);
     }
 
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= 0x80;          // TOOLWINDOW：不进 Alt+Tab
+            cp.ExStyle |= 0x08000000;    // NOACTIVATE：点击不抢焦点
+            return cp;
+        }
+    }
+
+    protected override bool ShowWithoutActivation { get { return true; } }
+
     // ---------- 配色 ----------
+    static readonly Color Brand = Color.FromArgb(22, 163, 74);
     static readonly Color Accent = Color.FromArgb(37, 99, 235);
-    static readonly Color Bg = Color.FromArgb(245, 246, 248);
     static readonly Color Line = Color.FromArgb(226, 229, 234);
     static readonly Color Muted = Color.FromArgb(110, 118, 129);
     static readonly Color Green = Color.FromArgb(22, 163, 74);
@@ -78,78 +162,42 @@ class LauncherForm : Form
     static readonly string OldCfg = System.IO.Path.Combine(
         AppDomain.CurrentDomain.BaseDirectory, "launcher.cfg");
 
+    const int S = 44;      // 小方块边长
+    const int PEEK = 6;    // 收起后露出的像素
+
     List<Item> items = new List<Item>();
-    Panel list = new Panel();
-    CheckBox keep = new CheckBox();
-    CheckBox multi = new CheckBox();
-    CheckBox trayChk = new CheckBox();
-    CheckBox autoUpd = new CheckBox();
+    ListForm popup = new ListForm();
     System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
     NotifyIcon tray;
     ContextMenuStrip trayMenu = new ContextMenuStrip();
     ToolTip tip = new ToolTip();
-    Button updBtn;
-    bool exiting = false, loading = true, balloonShown = false, updating = false;
+
+    bool keep = true, multi = true, autoUpdate = true;
+    bool exiting = false, loading = true, updating = false, busy = false;
+    Edge edge = Edge.Right;
+    int ax, ay;                           // 小方块中心的记忆位置
+    bool shown = true, pressed = false, dragging = false;
+    int enterTick = 0, leaveTick = -30, statusTick = 0, menuOpen = 0, running = 0;
+    Point downCursor, downLoc;
 
     public LauncherForm()
     {
         Text = "启动器";
-        Size = new Size(640, 440);
-        MinimumSize = new Size(520, 260);
-        Font = new Font("Microsoft YaHei UI", 9f);
-        BackColor = Bg;
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        TopMost = true;
+        StartPosition = FormStartPosition.Manual;
+        Size = new Size(S, S);
+        BackColor = Brand;
+        Cursor = Cursors.Hand;
         AllowDrop = true;
+        DoubleBuffered = true;
+        using (var gp = Round(new Rectangle(0, 0, S, S), 11)) Region = new Region(gp);
         try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-        // ---- 顶部标题栏 ----
-        var header = new Panel { Dock = DockStyle.Top, Height = 56, BackColor = Color.White };
-        var title = new Label
-        {
-            Text = "启动器", Left = 16, Top = 10, AutoSize = true,
-            Font = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold)
-        };
-        var ver = new Label
-        {
-            Text = "v" + AppInfo.Version, Left = 18, Top = 34, AutoSize = true,
-            ForeColor = Muted, Font = new Font("Microsoft YaHei UI", 8f)
-        };
-        var add = MkBtn("＋ 添加", Accent, Color.White, 84);
-        add.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        add.Top = 14; add.Left = header.Width - 84 - 16 - 96 - 8;
-        add.Click += delegate { AddDialog(); };
-        updBtn = MkBtn("检查更新", OffBg, Color.FromArgb(55, 65, 81), 96);
-        updBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        updBtn.Top = 14; updBtn.Left = header.Width - 96 - 16;
-        updBtn.Click += delegate { CheckUpdate(false); };
-        header.Controls.Add(title); header.Controls.Add(ver);
-        header.Controls.Add(add); header.Controls.Add(updBtn);
-        header.Paint += delegate (object s, PaintEventArgs e)
-        {
-            e.Graphics.DrawLine(new Pen(Line), 0, header.Height - 1, header.Width, header.Height - 1);
-        };
-
-        // ---- 选项栏 ----
-        var opts = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Top, Height = 38, WrapContents = false, BackColor = Color.White,
-            Padding = new Padding(12, 8, 6, 0)
-        };
-        keep.Text = "结束后保持窗口"; keep.AutoSize = true; keep.Checked = true;
-        multi.Text = "允许多开"; multi.AutoSize = true; multi.Checked = true;
-        trayChk.Text = "关闭/最小化到托盘"; trayChk.AutoSize = true; trayChk.Checked = true;
-        autoUpd.Text = "启动时检查更新"; autoUpd.AutoSize = true; autoUpd.Checked = true;
-        tip.SetToolTip(keep, "脚本结束后窗口保持打开，报错信息不会一闪而过");
-        opts.Controls.Add(keep); opts.Controls.Add(multi);
-        opts.Controls.Add(trayChk); opts.Controls.Add(autoUpd);
-        opts.Paint += delegate (object s, PaintEventArgs e)
-        {
-            e.Graphics.DrawLine(new Pen(Line), 0, opts.Height - 1, opts.Width, opts.Height - 1);
-        };
-
-        list.Dock = DockStyle.Fill; list.AutoScroll = true; list.BackColor = Bg;
-        list.AllowDrop = true;
-        Controls.Add(list); Controls.Add(opts); Controls.Add(header);
-
+        // ---- 列表弹层 ----
+        popup.Host.ClientSizeChanged += delegate { Layout_(); };
+        popup.Deactivate += delegate { if (!busy && menuOpen == 0) popup.Hide(); };
         DragEventHandler enter = delegate (object s, DragEventArgs e) { e.Effect = DragDropEffects.Copy; };
         DragEventHandler drop = delegate (object s, DragEventArgs e)
         {
@@ -157,9 +205,12 @@ class LauncherForm : Form
             if (files == null) return;
             foreach (var f in files) AddItem(System.IO.Path.GetFileNameWithoutExtension(f), f);
             Save();
+            ResizePopup();
         };
         DragEnter += enter; DragDrop += drop;
-        list.DragEnter += enter; list.DragDrop += drop;
+        popup.DragEnter += enter; popup.DragDrop += drop;
+        popup.AllowDrop = true; popup.Host.AllowDrop = true;
+        popup.Host.DragEnter += enter; popup.Host.DragDrop += drop;
 
         // ---- 托盘 ----
         tray = new NotifyIcon { Icon = Icon ?? SystemIcons.Application, Text = "启动器", Visible = true };
@@ -167,26 +218,29 @@ class LauncherForm : Form
         tray.ContextMenuStrip = trayMenu;
         tray.MouseDoubleClick += delegate (object s, MouseEventArgs e)
         {
-            if (e.Button == MouseButtons.Left) ToggleWindow();
+            if (e.Button == MouseButtons.Left) { shown = true; leaveTick = 0; ShowList(); }
         };
 
         CleanOld();
+
+        // 默认位置：主屏右侧偏上
+        var wa0 = Screen.PrimaryScreen.WorkingArea;
+        ax = wa0.Right - S / 2; ay = wa0.Top + wa0.Height / 3;
+
         Load_();
         loading = false;
         if (items.Count > 0 && !File.Exists(Cfg)) Save();
 
-        keep.CheckedChanged += delegate { Save(); };
-        multi.CheckedChanged += delegate { Save(); Refresh_(); };
-        trayChk.CheckedChanged += delegate { Save(); };
-        autoUpd.CheckedChanged += delegate { Save(); };
-
-        timer.Interval = 800;
-        timer.Tick += delegate { Refresh_(); };
-        timer.Start();
+        Location = Calc(true).Location;      // 启动时先露出，稍后自动收起
+        ResizePopup();
         Refresh_();
 
+        timer.Interval = 25;
+        timer.Tick += delegate { Tick_(); };
+        timer.Start();
+
         // 启动 3 秒后静默检查更新
-        if (autoUpd.Checked && !AppInfo.Repo.StartsWith("YOUR_", StringComparison.Ordinal))
+        if (autoUpdate && !AppInfo.Repo.StartsWith("YOUR_", StringComparison.Ordinal))
         {
             var t = new System.Windows.Forms.Timer { Interval = 3000 };
             t.Tick += delegate { t.Stop(); t.Dispose(); CheckUpdate(true); };
@@ -194,24 +248,239 @@ class LauncherForm : Form
         }
     }
 
-    static Button MkBtn(string text, Color back, Color fore, int w)
+    // ================= 绘制 =================
+    static GraphicsPath Round(Rectangle r, int rad)
     {
-        var b = new Button
-        {
-            Text = text, Width = w, Height = 28, FlatStyle = FlatStyle.Flat,
-            BackColor = back, ForeColor = fore, Cursor = Cursors.Hand,
-            UseVisualStyleBackColor = false
-        };
-        b.FlatAppearance.BorderSize = 0;
-        return b;
+        var p = new GraphicsPath();
+        int d = rad * 2;
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
     }
 
-    static void SetBtn(Button b, bool on, Color backOn, Color foreOn)
+    protected override void OnPaint(PaintEventArgs e)
     {
-        b.Enabled = on;
-        b.BackColor = on ? backOn : OffBg;
-        b.ForeColor = on ? foreOn : OffFg;
-        b.Cursor = on ? Cursors.Hand : Cursors.Default;
+        base.OnPaint(e);
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        float k = S / 96f;
+        using (var gp = Round(new Rectangle(0, 0, S - 1, S - 1), 11))
+        using (var br = new SolidBrush(Brand))
+            g.FillPath(br, gp);
+        using (var pen = new Pen(Color.White, 10 * k))
+        {
+            pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round; pen.LineJoin = LineJoin.Round;
+            g.DrawLines(pen, new PointF[] {
+                new PointF(32 * k, 24 * k), new PointF(32 * k, 68 * k), new PointF(66 * k, 68 * k) });
+        }
+        g.FillEllipse(Brushes.White, 62 * k, 24 * k, 12 * k, 12 * k);
+        if (running > 0)
+        {
+            // 有项目在运行：右上角小圆点
+            g.FillEllipse(Brushes.White, S - 13, 2, 11, 11);
+            using (var br = new SolidBrush(Color.FromArgb(245, 158, 11)))
+                g.FillEllipse(br, S - 11, 4, 7, 7);
+        }
+    }
+
+    // ================= 贴边 / 收起 / 滑出 =================
+    static int Clamp(int v, int lo, int hi)
+    {
+        if (hi < lo) hi = lo;
+        return Math.Max(lo, Math.Min(hi, v));
+    }
+
+    Rectangle Calc(bool shownState)
+    {
+        var wa = Screen.FromPoint(new Point(ax, ay)).WorkingArea;
+        int x, y;
+        if (edge == Edge.Left || edge == Edge.Right)
+        {
+            y = Clamp(ay - S / 2, wa.Top, wa.Bottom - S);
+            if (edge == Edge.Left) x = shownState ? wa.Left : wa.Left + PEEK - S;
+            else x = shownState ? wa.Right - S : wa.Right - PEEK;
+        }
+        else
+        {
+            x = Clamp(ax - S / 2, wa.Left, wa.Right - S);
+            if (edge == Edge.Top) y = shownState ? wa.Top : wa.Top + PEEK - S;
+            else y = shownState ? wa.Bottom - S : wa.Bottom - PEEK;
+        }
+        return new Rectangle(x, y, S, S);
+    }
+
+    bool InHot(Point c)
+    {
+        var d = Calc(true);
+        var wa = Screen.FromPoint(new Point(ax, ay)).WorkingArea;
+        int t = 6, m = 14;
+        Rectangle r;
+        switch (edge)
+        {
+            case Edge.Left: r = new Rectangle(wa.Left, d.Top - m, t, S + 2 * m); break;
+            case Edge.Right: r = new Rectangle(wa.Right - t, d.Top - m, t, S + 2 * m); break;
+            case Edge.Top: r = new Rectangle(d.Left - m, wa.Top, S + 2 * m, t); break;
+            default: r = new Rectangle(d.Left - m, wa.Bottom - t, S + 2 * m, t); break;
+        }
+        return r.Contains(c);
+    }
+
+    bool IsFullscreen()
+    {
+        try
+        {
+            IntPtr h = GetForegroundWindow();
+            if (h == IntPtr.Zero || h == Handle) return false;
+            if (popup.IsHandleCreated && h == popup.Handle) return false;
+            RECT r;
+            if (!GetWindowRect(h, out r)) return false;
+            var sb = new StringBuilder(64);
+            GetClassName(h, sb, 64);
+            string cn = sb.ToString();
+            if (cn == "Progman" || cn == "WorkerW" || cn == "Shell_TrayWnd") return false;
+            if ((GetWindowLong(h, -16) & 0xC00000) == 0xC00000) return false;   // 有标题栏，不是全屏
+            var b = Screen.FromHandle(h).Bounds;
+            return r.Left <= b.Left && r.Top <= b.Top && r.Right >= b.Right && r.Bottom >= b.Bottom;
+        }
+        catch { return false; }
+    }
+
+    static int Step(int d)
+    {
+        if (Math.Abs(d) <= 2) return d;
+        return (int)Math.Round(d * 0.35);
+    }
+
+    void Animate()
+    {
+        Point t = Calc(shown).Location;
+        if (t == Location) return;
+        Location = new Point(Left + Step(t.X - Left), Top + Step(t.Y - Top));
+    }
+
+    void Tick_()
+    {
+        if (++statusTick >= 32) { statusTick = 0; Refresh_(); }
+        if (!Visible || dragging) return;
+        Point c = Cursor.Position;
+
+        // 点击列表和小方块之外：收起列表
+        if (popup.Visible && !busy && menuOpen == 0 && !trayMenu.Visible && Control.MouseButtons != MouseButtons.None)
+        {
+            if (!popup.Bounds.Contains(c) && !Bounds.Contains(c)) popup.Hide();
+        }
+
+        if (shown)
+        {
+            Rectangle near = Rectangle.Inflate(Calc(true), 24, 24);
+            bool keepOpen = popup.Visible || busy || trayMenu.Visible || menuOpen > 0 || pressed || near.Contains(c);
+            if (keepOpen) leaveTick = 0;
+            else if (++leaveTick >= 28) { shown = false; leaveTick = 0; }   // 约 0.7 秒后收起
+        }
+        else
+        {
+            if (InHot(c) && !IsFullscreen())
+            {
+                if (++enterTick >= 5) { shown = true; enterTick = 0; leaveTick = 0; }   // 停留约 0.12 秒滑出
+            }
+            else enterTick = 0;
+        }
+        Animate();
+    }
+
+    // ---------- 拖动与点击 ----------
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        pressed = true; dragging = false;
+        downCursor = Cursor.Position; downLoc = Location;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (!pressed) return;
+        Point c = Cursor.Position;
+        if (!dragging && (Math.Abs(c.X - downCursor.X) > 4 || Math.Abs(c.Y - downCursor.Y) > 4))
+        {
+            dragging = true;
+            popup.Hide();
+        }
+        if (dragging)
+            Location = new Point(downLoc.X + c.X - downCursor.X, downLoc.Y + c.Y - downCursor.Y);
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (!pressed || e.Button != MouseButtons.Left) return;
+        pressed = false;
+        if (dragging) { dragging = false; SnapToEdge(); }
+        else ToggleList();
+    }
+
+    void SnapToEdge()
+    {
+        var c = new Point(Left + S / 2, Top + S / 2);
+        var wa = Screen.FromPoint(c).WorkingArea;
+        int dl = c.X - wa.Left, dr = wa.Right - c.X, dt = c.Y - wa.Top, db = wa.Bottom - c.Y;
+        int m = Math.Min(Math.Min(dl, dr), Math.Min(dt, db));
+        edge = m == dl ? Edge.Left : (m == dr ? Edge.Right : (m == dt ? Edge.Top : Edge.Bottom));
+        ax = c.X; ay = c.Y;
+        shown = true; leaveTick = 0;
+        var b = Calc(true);
+        ax = b.X + S / 2; ay = b.Y + S / 2;
+        Save();
+    }
+
+    // ================= 列表弹层 =================
+    void ResizePopup()
+    {
+        int n = items.Count;
+        int h = n == 0 ? 80 : Math.Min(n * 34 + 12, 340);
+        popup.Size = new Size(260, h);
+        Layout_();
+        if (popup.Visible) PlacePopup();
+    }
+
+    void PlacePopup()
+    {
+        var d = Calc(true);
+        var wa = Screen.FromPoint(new Point(ax, ay)).WorkingArea;
+        int w = popup.Width, h = popup.Height, x, y;
+        switch (edge)
+        {
+            case Edge.Left:
+                x = d.Right + 6; y = Clamp(d.Top, wa.Top, wa.Bottom - h); break;
+            case Edge.Right:
+                x = d.Left - w - 6; y = Clamp(d.Top, wa.Top, wa.Bottom - h); break;
+            case Edge.Top:
+                y = d.Bottom + 6; x = Clamp(d.Left, wa.Left, wa.Right - w); break;
+            default:
+                y = d.Top - h - 6; x = Clamp(d.Left, wa.Left, wa.Right - w); break;
+        }
+        popup.Location = new Point(x, y);
+    }
+
+    void ShowList()
+    {
+        if (!Visible) Show();
+        ResizePopup();
+        PlacePopup();
+        popup.Show();
+        popup.BringToFront();
+        popup.Activate();
+    }
+
+    void ToggleList()
+    {
+        if (popup.Visible) { popup.Hide(); return; }
+        shown = true; leaveTick = 0;
+        ShowList();
     }
 
     // ================= 配置 =================
@@ -226,11 +495,24 @@ class LauncherForm : Form
                 var kv = line.Substring(1).Split(new char[] { '=' });
                 if (kv.Length == 2)
                 {
-                    bool v = kv[1].Trim() == "1";
-                    if (kv[0] == "keep") keep.Checked = v;
-                    else if (kv[0] == "multi") multi.Checked = v;
-                    else if (kv[0] == "tray") trayChk.Checked = v;
-                    else if (kv[0] == "autoupdate") autoUpd.Checked = v;
+                    string key = kv[0], val = kv[1].Trim();
+                    if (key == "keep") keep = val == "1";
+                    else if (key == "multi") multi = val == "1";
+                    else if (key == "autoupdate") autoUpdate = val == "1";
+                    else if (key == "edge")
+                    {
+                        if (val == "left") edge = Edge.Left;
+                        else if (val == "top") edge = Edge.Top;
+                        else if (val == "bottom") edge = Edge.Bottom;
+                        else edge = Edge.Right;
+                    }
+                    else if (key == "pos")
+                    {
+                        var ps = val.Split(new char[] { ',' });
+                        int px, py;
+                        if (ps.Length == 2 && int.TryParse(ps[0], out px) && int.TryParse(ps[1], out py))
+                        { ax = px; ay = py; }
+                    }
                 }
                 continue;
             }
@@ -243,42 +525,61 @@ class LauncherForm : Form
     {
         if (loading) return;
         var sb = new StringBuilder();
-        sb.AppendLine("#keep=" + (keep.Checked ? "1" : "0"));
-        sb.AppendLine("#multi=" + (multi.Checked ? "1" : "0"));
-        sb.AppendLine("#tray=" + (trayChk.Checked ? "1" : "0"));
-        sb.AppendLine("#autoupdate=" + (autoUpd.Checked ? "1" : "0"));
+        sb.AppendLine("#keep=" + (keep ? "1" : "0"));
+        sb.AppendLine("#multi=" + (multi ? "1" : "0"));
+        sb.AppendLine("#autoupdate=" + (autoUpdate ? "1" : "0"));
+        sb.AppendLine("#edge=" + edge.ToString().ToLowerInvariant());
+        sb.AppendLine("#pos=" + ax + "," + ay);
         foreach (var it in items) sb.AppendLine(it.Name + "|" + it.Path);
         Directory.CreateDirectory(Dir);
         File.WriteAllText(Cfg, sb.ToString(), new UTF8Encoding(false));
     }
 
-    // ================= 列表 =================
+    // ================= 列表项 =================
+    static Button MkBtn(string text, Color back, Color fore, int w, int h)
+    {
+        var b = new Button
+        {
+            Text = text, Width = w, Height = h, FlatStyle = FlatStyle.Flat,
+            BackColor = back, ForeColor = fore, Cursor = Cursors.Hand,
+            UseVisualStyleBackColor = false, Font = new Font("Microsoft YaHei UI", 8f)
+        };
+        b.FlatAppearance.BorderSize = 0;
+        return b;
+    }
+
+    static void SetBtn(Button b, bool on, Color backOn, Color foreOn)
+    {
+        b.Enabled = on;
+        b.BackColor = on ? backOn : OffBg;
+        b.ForeColor = on ? foreOn : OffFg;
+        b.Cursor = on ? Cursors.Hand : Cursors.Default;
+    }
+
     void AddItem(string name, string path)
     {
         var it = new Item { Name = name, Path = path };
 
-        it.Row = new Panel { Height = 48, BackColor = Color.White };
-        it.Row.Paint += delegate (object s, PaintEventArgs e)
+        it.Row = new Panel { Height = 32, BackColor = Color.White };
+        it.Dot = new Label
         {
-            var r = it.Row;
-            e.Graphics.DrawRectangle(new Pen(Line), 0, 0, r.Width - 1, r.Height - 1);
+            Text = "●", ForeColor = OffFg, AutoSize = false, TextAlign = ContentAlignment.MiddleCenter,
+            Font = new Font("Microsoft YaHei UI", 8f)
         };
-        it.Dot = new Label { Text = "●", ForeColor = OffFg, AutoSize = false, TextAlign = ContentAlignment.MiddleCenter };
-        it.NameLbl = new Label
-        {
-            AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft,
-            Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold)
-        };
-        it.PathLbl = new Label { AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Muted };
-        it.Start = MkBtn("启动", Accent, Color.White, 60);
-        it.Stop = MkBtn("关闭", DangerBg, Danger, 60);
+        it.NameLbl = new Label { AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft, Cursor = Cursors.Hand };
+        it.Start = MkBtn("▶", Accent, Color.White, 30, 24);
+        it.Stop = MkBtn("■", DangerBg, Danger, 30, 24);
         it.Start.Click += delegate { Run(it); };
         it.Stop.Click += delegate { Kill(it, false); };
+        it.NameLbl.DoubleClick += delegate { Run(it); };
 
-        tip.SetToolTip(it.PathLbl, path);
-        tip.SetToolTip(it.NameLbl, path);
+        tip.SetToolTip(it.NameLbl, path + "\n（双击启动，右键更多）");
+        tip.SetToolTip(it.Start, "启动");
+        tip.SetToolTip(it.Stop, "关闭");
 
         var menu = new ContextMenuStrip();
+        menu.Opened += delegate { menuOpen++; };
+        menu.Closed += delegate { if (menuOpen > 0) menuOpen--; };
         menu.Items.Add("重命名").Click += delegate { Rename(it); };
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("关闭最近启动的一个").Click += delegate { Kill(it, true); };
@@ -287,18 +588,16 @@ class LauncherForm : Form
         menu.Items.Add("移除此项").Click += delegate
         {
             Kill(it, false);
-            list.Controls.Remove(it.Row);
-            items.Remove(it); Save(); Layout_();
+            popup.Host.Controls.Remove(it.Row);
+            items.Remove(it); Save(); ResizePopup();
         };
         it.Row.ContextMenuStrip = menu;
         it.Dot.ContextMenuStrip = menu;
         it.NameLbl.ContextMenuStrip = menu;
-        it.PathLbl.ContextMenuStrip = menu;
-        it.NameLbl.DoubleClick += delegate { Rename(it); };
 
-        it.Row.Controls.Add(it.Dot); it.Row.Controls.Add(it.NameLbl); it.Row.Controls.Add(it.PathLbl);
+        it.Row.Controls.Add(it.Dot); it.Row.Controls.Add(it.NameLbl);
         it.Row.Controls.Add(it.Start); it.Row.Controls.Add(it.Stop);
-        list.Controls.Add(it.Row);
+        popup.Host.Controls.Add(it.Row);
         items.Add(it);
         Layout_();
         Refresh_();
@@ -317,18 +616,17 @@ class LauncherForm : Form
 
     void Layout_()
     {
-        int y = 10;
-        int w = Math.Max(list.ClientSize.Width - 20, 300);
+        popup.Empty.Visible = items.Count == 0;
+        int y = 6;
+        int w = Math.Max(popup.Host.ClientSize.Width - 8, 200);
         foreach (var it in items)
         {
-            it.Row.SetBounds(10, y, w, 48);
-            it.Dot.SetBounds(6, 10, 24, 28);
-            it.NameLbl.SetBounds(32, 4, 150, 40);
-            int btnArea = 60 + 60 + 8 + 12 + 8;
-            it.PathLbl.SetBounds(188, 4, Math.Max(w - 188 - btnArea, 40), 40);
-            it.Start.SetBounds(w - 60 - 60 - 8 - 10, 10, 60, 28);
-            it.Stop.SetBounds(w - 60 - 10, 10, 60, 28);
-            y += 56;
+            it.Row.SetBounds(4, y, w, 32);
+            it.Dot.SetBounds(2, 4, 20, 24);
+            it.NameLbl.SetBounds(24, 4, Math.Max(w - 24 - 30 - 30 - 12, 40), 24);
+            it.Start.SetBounds(w - 30 - 4 - 30 - 4, 4, 30, 24);
+            it.Stop.SetBounds(w - 30 - 4, 4, 30, 24);
+            y += 34;
         }
     }
 
@@ -340,19 +638,19 @@ class LauncherForm : Form
             int n = it.Count;
             total += n;
             it.NameLbl.Text = it.Name + (n > 1 ? "  ×" + n : "");
-            it.PathLbl.Text = it.Path;
             it.Dot.ForeColor = n > 0 ? Green : OffFg;
             it.NameLbl.ForeColor = n > 0 ? Green : SystemColors.ControlText;
-            SetBtn(it.Start, multi.Checked || n == 0, Accent, Color.White);
+            SetBtn(it.Start, multi || n == 0, Accent, Color.White);
             SetBtn(it.Stop, n > 0, DangerBg, Danger);
         }
+        if (total != running) { running = total; Invalidate(); }
         tray.Text = total > 0 ? "启动器 · 运行中 " + total : "启动器";
     }
 
     // ================= 启动 / 关闭 =================
     void Run(Item it)
     {
-        if (!multi.Checked && it.Count > 0) return;
+        if (!multi && it.Count > 0) return;
         try
         {
             var psi = new ProcessStartInfo();
@@ -362,19 +660,19 @@ class LauncherForm : Form
             if (ext == ".ps1")
             {
                 psi.FileName = "powershell.exe";
-                psi.Arguments = "-NoProfile -ExecutionPolicy Bypass " + (keep.Checked ? "-NoExit " : "")
+                psi.Arguments = "-NoProfile -ExecutionPolicy Bypass " + (keep ? "-NoExit " : "")
                               + "-File \"" + it.Path + "\"";
             }
             else if (ext == ".bat" || ext == ".cmd")
             {
                 psi.FileName = "cmd.exe";
-                psi.Arguments = (keep.Checked ? "/k" : "/c") + " \"\"" + it.Path + "\"\"";
+                psi.Arguments = (keep ? "/k" : "/c") + " \"\"" + it.Path + "\"\"";
             }
             else psi.FileName = it.Path;
             var p = Process.Start(psi);
             if (p != null) it.Procs.Add(p);
         }
-        catch (Exception ex) { MessageBox.Show(ex.Message, "启动失败"); }
+        catch (Exception ex) { Msg(ex.Message, "启动失败", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         Refresh_();
     }
 
@@ -398,25 +696,16 @@ class LauncherForm : Form
         Refresh_();
     }
 
-    // ================= 托盘 =================
-    void ShowWindow_()
-    {
-        Show();
-        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
-        BringToFront();
-        Activate();
-    }
-
-    void ToggleWindow()
-    {
-        if (Visible && WindowState != FormWindowState.Minimized) { Hide(); return; }
-        ShowWindow_();
-    }
-
+    // ================= 托盘菜单（其他功能都在这里） =================
     void BuildTrayMenu()
     {
         trayMenu.Items.Clear();
-        trayMenu.Items.Add(Visible ? "隐藏窗口" : "显示窗口").Click += delegate { ToggleWindow(); };
+        trayMenu.Items.Add("打开列表").Click += delegate { shown = true; leaveTick = 0; ShowList(); };
+        trayMenu.Items.Add(Visible ? "隐藏小方块" : "显示小方块").Click += delegate
+        {
+            if (Visible) { popup.Hide(); Hide(); }
+            else { Show(); shown = true; leaveTick = -30; Location = Calc(true).Location; }
+        };
         trayMenu.Items.Add(new ToolStripSeparator());
 
         bool any = false;
@@ -427,21 +716,37 @@ class LauncherForm : Form
             if (n > 0) any = true;
             var mi = trayMenu.Items.Add((n > 0 ? "● " : "○ ") + it.Name + (n > 1 ? "  ×" + n : ""));
             mi.ToolTipText = it.Path;
-            mi.Enabled = multi.Checked || n == 0;
+            mi.Enabled = multi || n == 0;
             mi.Click += delegate { Run(it); };
         }
         if (items.Count > 0) trayMenu.Items.Add(new ToolStripSeparator());
 
+        trayMenu.Items.Add("＋ 添加项目…").Click += delegate { AddDialog(); };
+        trayMenu.Items.Add(new ToolStripSeparator());
+
+        var o1 = new ToolStripMenuItem("结束后保持窗口（防闪退）") { Checked = keep };
+        o1.Click += delegate { keep = !keep; Save(); };
+        var o2 = new ToolStripMenuItem("允许多开") { Checked = multi };
+        o2.Click += delegate { multi = !multi; Save(); Refresh_(); };
+        var o3 = new ToolStripMenuItem("启动时检查更新") { Checked = autoUpdate };
+        o3.Click += delegate { autoUpdate = !autoUpdate; Save(); };
+        trayMenu.Items.Add(o1); trayMenu.Items.Add(o2); trayMenu.Items.Add(o3);
+        trayMenu.Items.Add(new ToolStripSeparator());
+
+        trayMenu.Items.Add("检查更新").Click += delegate { CheckUpdate(false); };
+        var ver = trayMenu.Items.Add("版本 v" + AppInfo.Version);
+        ver.Enabled = false;
         var closeAll = trayMenu.Items.Add("关闭全部运行项");
         closeAll.Enabled = any;
         closeAll.Click += delegate { foreach (var it in items) Kill(it, false); };
-
         trayMenu.Items.Add("退出").Click += delegate { ExitApp(); };
     }
 
     void ExitApp()
     {
         exiting = true;
+        timer.Stop();
+        popup.Hide();
         tray.Visible = false;
         tray.Dispose();
         Application.Exit();
@@ -449,43 +754,26 @@ class LauncherForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        if (!exiting && trayChk.Checked && e.CloseReason == CloseReason.UserClosing)
+        if (!exiting && e.CloseReason == CloseReason.UserClosing)
         {
             e.Cancel = true;
-            Hide();
-            if (!balloonShown)
-            {
-                balloonShown = true;
-                tray.ShowBalloonTip(2000, "启动器", "已收到托盘，右键托盘图标可退出。", ToolTipIcon.Info);
-            }
             return;
         }
         tray.Visible = false;
         base.OnFormClosing(e);
     }
 
-    protected override void OnResize(EventArgs e)
-    {
-        base.OnResize(e);
-        if (WindowState == FormWindowState.Minimized && trayChk.Checked && !loading)
-        {
-            Hide();
-            return;
-        }
-        Layout_();
-    }
-
     // ================= 程序内更新（GitHub Releases） =================
-    // 发布时：新建 Release，tag 形如 v1.1.2，并上传编译好的 exe 作为附件
+    // 发布时：新建 Release，tag 形如 v1.2.1，并上传编译好的 exe 作为附件
     void CheckUpdate(bool silent)
     {
         if (updating) return;
         if (AppInfo.Repo.StartsWith("YOUR_", StringComparison.Ordinal))
         {
-            if (!silent) MessageBox.Show("更新功能暂不可用：程序未设置更新来源。", "检查更新");
+            if (!silent) Msg("更新功能暂不可用：程序未设置更新来源。", "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
-        updBtn.Enabled = false; updBtn.Text = "检查中…";
+        if (!silent) tray.ShowBalloonTip(1500, "启动器", "正在检查更新…", ToolTipIcon.Info);
         ThreadPool.QueueUserWorkItem(delegate
         {
             string latest = null, url = null, err = null;
@@ -506,28 +794,27 @@ class LauncherForm : Form
 
     void OnCheckDone(bool silent, string latest, string url, string err)
     {
-        updBtn.Enabled = true; updBtn.Text = "检查更新";
         if (err != null)
         {
-            if (!silent) MessageBox.Show("检查更新失败：" + err, "检查更新");
+            if (!silent) Msg("检查更新失败：" + err, "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
         Version cur = new Version(AppInfo.Version), nw;
         try { nw = new Version(latest); } catch { return; }
         if (nw > cur)
         {
-            if (MessageBox.Show("发现新版本 v" + latest + "（当前 v" + AppInfo.Version + "），是否立即更新？\n更新后会自动重启。",
+            if (Msg("发现新版本 v" + latest + "（当前 v" + AppInfo.Version + "），是否立即更新？\n更新后会自动重启。",
                 "发现新版本", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
                 DoUpdate(url);
         }
         else if (!silent)
-            MessageBox.Show("当前已是最新版本（v" + AppInfo.Version + "）。", "检查更新");
+            Msg("当前已是最新版本（v" + AppInfo.Version + "）。", "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     void DoUpdate(string url)
     {
         updating = true;
-        updBtn.Enabled = false; updBtn.Text = "下载中…";
+        tray.ShowBalloonTip(2000, "启动器", "正在下载更新…", ToolTipIcon.Info);
         string cur = Application.ExecutablePath;
         string tmp = cur + ".new";
         ThreadPool.QueueUserWorkItem(delegate
@@ -553,11 +840,10 @@ class LauncherForm : Form
     void ApplyUpdate(string tmp, string err)
     {
         updating = false;
-        updBtn.Enabled = true; updBtn.Text = "检查更新";
         if (err != null)
         {
             try { File.Delete(tmp); } catch { }
-            MessageBox.Show("更新失败：" + err, "更新");
+            Msg("更新失败：" + err, "更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
         string cur = Application.ExecutablePath;
@@ -573,7 +859,7 @@ class LauncherForm : Form
         catch (Exception ex)
         {
             try { if (!File.Exists(cur) && File.Exists(old)) File.Move(old, cur); } catch { }
-            MessageBox.Show("替换程序失败：" + ex.Message, "更新");
+            Msg("替换程序失败：" + ex.Message, "更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -598,59 +884,89 @@ class LauncherForm : Form
     }
 
     // ================= 对话框 =================
+    // 小方块贴在屏幕边缘，对话框统一居中、置顶显示
+    DialogResult Msg(string text, string caption, MessageBoxButtons b, MessageBoxIcon i)
+    {
+        busy = true;
+        try
+        {
+            using (var o = new Form
+            {
+                TopMost = true, ShowInTaskbar = false, StartPosition = FormStartPosition.CenterScreen,
+                Size = new Size(1, 1), Opacity = 0, FormBorderStyle = FormBorderStyle.None
+            })
+            {
+                o.Show();
+                return MessageBox.Show(o, text, caption, b, i);
+            }
+        }
+        finally { busy = false; }
+    }
+
     string Prompt(string title, string label, string init)
     {
-        var f = new Form
+        busy = true;
+        try
         {
-            Text = title, Size = new Size(400, 150), FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false,
-            ShowInTaskbar = false
-        };
-        f.Font = Font;
-        var l = new Label { Text = label, Left = 14, Top = 18, Width = 60 };
-        var t = new TextBox { Left = 78, Top = 14, Width = 290, Text = init };
-        var ok = new Button { Text = "确定", Left = 208, Top = 58, Width = 76, DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = "取消", Left = 292, Top = 58, Width = 76, DialogResult = DialogResult.Cancel };
-        f.AcceptButton = ok; f.CancelButton = cancel;
-        f.Controls.AddRange(new Control[] { l, t, ok, cancel });
-        f.Shown += delegate { t.SelectAll(); t.Focus(); };
-        return f.ShowDialog(this) == DialogResult.OK ? t.Text : null;
+            var f = new Form
+            {
+                Text = title, Size = new Size(400, 150), FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterScreen, MaximizeBox = false, MinimizeBox = false,
+                ShowInTaskbar = false, TopMost = true
+            };
+            f.Font = new Font("Microsoft YaHei UI", 9f);
+            var l = new Label { Text = label, Left = 14, Top = 18, Width = 60 };
+            var t = new TextBox { Left = 78, Top = 14, Width = 290, Text = init };
+            var ok = new Button { Text = "确定", Left = 208, Top = 58, Width = 76, DialogResult = DialogResult.OK };
+            var cancel = new Button { Text = "取消", Left = 292, Top = 58, Width = 76, DialogResult = DialogResult.Cancel };
+            f.AcceptButton = ok; f.CancelButton = cancel;
+            f.Controls.AddRange(new Control[] { l, t, ok, cancel });
+            f.Shown += delegate { t.SelectAll(); t.Focus(); };
+            return f.ShowDialog() == DialogResult.OK ? t.Text : null;
+        }
+        finally { busy = false; }
     }
 
     void AddDialog()
     {
-        var f = new Form
+        busy = true;
+        try
         {
-            Text = "添加", Size = new Size(460, 160), FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false,
-            ShowInTaskbar = false
-        };
-        f.Font = Font;
-        var l1 = new Label { Text = "名称", Left = 12, Top = 16, Width = 40 };
-        var n = new TextBox { Left = 56, Top = 12, Width = 370 };
-        var l2 = new Label { Text = "路径", Left = 12, Top = 50, Width = 40 };
-        var p = new TextBox { Left = 56, Top = 46, Width = 300 };
-        var b = new Button { Text = "浏览", Left = 362, Top = 44, Width = 64 };
-        var ok = new Button { Text = "确定", Left = 270, Top = 84, Width = 76, DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = "取消", Left = 350, Top = 84, Width = 76, DialogResult = DialogResult.Cancel };
-        b.Click += delegate
-        {
-            var d = new OpenFileDialog { Filter = "脚本/程序|*.ps1;*.bat;*.cmd;*.exe|所有文件|*.*" };
-            if (d.ShowDialog() == DialogResult.OK)
+            var f = new Form
             {
-                p.Text = d.FileName;
-                if (n.Text.Length == 0) n.Text = System.IO.Path.GetFileNameWithoutExtension(d.FileName);
+                Text = "添加", Size = new Size(460, 160), FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterScreen, MaximizeBox = false, MinimizeBox = false,
+                ShowInTaskbar = false, TopMost = true
+            };
+            f.Font = new Font("Microsoft YaHei UI", 9f);
+            var l1 = new Label { Text = "名称", Left = 12, Top = 16, Width = 40 };
+            var n = new TextBox { Left = 56, Top = 12, Width = 370 };
+            var l2 = new Label { Text = "路径", Left = 12, Top = 50, Width = 40 };
+            var p = new TextBox { Left = 56, Top = 46, Width = 300 };
+            var b = new Button { Text = "浏览", Left = 362, Top = 44, Width = 64 };
+            var ok = new Button { Text = "确定", Left = 270, Top = 84, Width = 76, DialogResult = DialogResult.OK };
+            var cancel = new Button { Text = "取消", Left = 350, Top = 84, Width = 76, DialogResult = DialogResult.Cancel };
+            b.Click += delegate
+            {
+                var d = new OpenFileDialog { Filter = "脚本/程序|*.ps1;*.bat;*.cmd;*.exe|所有文件|*.*" };
+                if (d.ShowDialog() == DialogResult.OK)
+                {
+                    p.Text = d.FileName;
+                    if (n.Text.Length == 0) n.Text = System.IO.Path.GetFileNameWithoutExtension(d.FileName);
+                }
+            };
+            f.AcceptButton = ok; f.CancelButton = cancel;
+            f.Controls.AddRange(new Control[] { l1, n, l2, p, b, ok, cancel });
+            if (f.ShowDialog() == DialogResult.OK && p.Text.Trim().Length > 0)
+            {
+                string name = n.Text.Trim().Length > 0 ? n.Text.Trim().Replace("|", " ")
+                            : System.IO.Path.GetFileNameWithoutExtension(p.Text.Trim());
+                AddItem(name, p.Text.Trim().Trim(new char[] { '"' }));
+                Save();
+                ResizePopup();
             }
-        };
-        f.AcceptButton = ok; f.CancelButton = cancel;
-        f.Controls.AddRange(new Control[] { l1, n, l2, p, b, ok, cancel });
-        if (f.ShowDialog(this) == DialogResult.OK && p.Text.Trim().Length > 0)
-        {
-            string name = n.Text.Trim().Length > 0 ? n.Text.Trim().Replace("|", " ")
-                        : System.IO.Path.GetFileNameWithoutExtension(p.Text.Trim());
-            AddItem(name, p.Text.Trim().Trim(new char[] { '"' }));
-            Save();
         }
+        finally { busy = false; }
     }
 }
 
@@ -672,7 +988,7 @@ static class Program
         }
         if (!created)
         {
-            LauncherForm.NotifyExisting();   // 已有实例：唤出它（包括收在托盘里的）
+            LauncherForm.NotifyExisting();   // 已有实例：唤出它的列表（即使小方块已隐藏）
             return;
         }
         Application.EnableVisualStyles();

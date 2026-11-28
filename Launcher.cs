@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Net;
+using Microsoft.Win32;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -13,7 +15,7 @@ using System.Windows.Forms;
 
 static class AppInfo
 {
-    public const string Version = "1.2.0";
+    public const string Version = "1.2.1";
     // GitHub 仓库，格式：用户名/仓库名
     public const string Repo = "lotusVienna/Launcher";
 }
@@ -114,6 +116,29 @@ class LauncherForm : Form
     [DllImport("user32.dll")]
     static extern int GetWindowLong(IntPtr h, int idx);
 
+    // ---------- 逐像素透明窗口（圆角无锯齿） ----------
+    [StructLayout(LayoutKind.Sequential)]
+    struct POINT { public int x, y; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct SIZE { public int cx, cy; }
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, IntPtr pptDst, ref SIZE psize,
+        IntPtr hdcSrc, ref POINT pptSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
+    [DllImport("user32.dll")]
+    static extern IntPtr GetDC(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    [DllImport("gdi32.dll")]
+    static extern IntPtr CreateCompatibleDC(IntPtr hDC);
+    [DllImport("gdi32.dll")]
+    static extern bool DeleteDC(IntPtr hDC);
+    [DllImport("gdi32.dll")]
+    static extern IntPtr SelectObject(IntPtr hDC, IntPtr hObj);
+    [DllImport("gdi32.dll")]
+    static extern bool DeleteObject(IntPtr hObj);
+
     public static void NotifyExisting()
     {
         PostMessage((IntPtr)0xFFFF, WM_SHOWME, IntPtr.Zero, IntPtr.Zero);
@@ -138,6 +163,7 @@ class LauncherForm : Form
             var cp = base.CreateParams;
             cp.ExStyle |= 0x80;          // TOOLWINDOW：不进 Alt+Tab
             cp.ExStyle |= 0x08000000;    // NOACTIVATE：点击不抢焦点
+            cp.ExStyle |= 0x80000;       // LAYERED：逐像素透明，边缘抗锯齿
             return cp;
         }
     }
@@ -192,7 +218,6 @@ class LauncherForm : Form
         Cursor = Cursors.Hand;
         AllowDrop = true;
         DoubleBuffered = true;
-        using (var gp = Round(new Rectangle(0, 0, S, S), 11)) Region = new Region(gp);
         try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
         // ---- 列表弹层 ----
@@ -216,12 +241,14 @@ class LauncherForm : Form
         tray = new NotifyIcon { Icon = Icon ?? SystemIcons.Application, Text = "启动器", Visible = true };
         trayMenu.Opening += delegate { BuildTrayMenu(); };
         tray.ContextMenuStrip = trayMenu;
+        ContextMenuStrip = trayMenu;      // 右键小方块 = 同一份菜单
         tray.MouseDoubleClick += delegate (object s, MouseEventArgs e)
         {
             if (e.Button == MouseButtons.Left) { shown = true; leaveTick = 0; ShowList(); }
         };
 
         CleanOld();
+        if (IsAutoStart()) SetAutoStart(true);   // 程序被移动过位置时，自动修正开机启动路径
 
         // 默认位置：主屏右侧偏上
         var wa0 = Screen.PrimaryScreen.WorkingArea;
@@ -261,11 +288,49 @@ class LauncherForm : Form
         return p;
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    protected override void OnHandleCreated(EventArgs e)
     {
-        base.OnPaint(e);
-        var g = e.Graphics;
+        base.OnHandleCreated(e);
+        UpdateSkin();
+    }
+
+    // 把小方块画成带透明通道的位图，交给系统逐像素合成
+    void UpdateSkin()
+    {
+        if (!IsHandleCreated) return;
+        using (var bmp = new Bitmap(S, S, PixelFormat.Format32bppArgb))
+        {
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.Clear(Color.Transparent);
+                DrawSkin(g);
+            }
+            IntPtr screenDc = GetDC(IntPtr.Zero);
+            IntPtr memDc = CreateCompatibleDC(screenDc);
+            IntPtr hBmp = IntPtr.Zero, oldObj = IntPtr.Zero;
+            try
+            {
+                hBmp = bmp.GetHbitmap(Color.FromArgb(0));
+                oldObj = SelectObject(memDc, hBmp);
+                var size = new SIZE(); size.cx = S; size.cy = S;
+                var src = new POINT();
+                var bf = new BLENDFUNCTION();
+                bf.BlendOp = 0; bf.BlendFlags = 0; bf.SourceConstantAlpha = 255; bf.AlphaFormat = 1;
+                UpdateLayeredWindow(Handle, screenDc, IntPtr.Zero, ref size, memDc, ref src, 0, ref bf, 2);
+            }
+            finally
+            {
+                if (hBmp != IntPtr.Zero) { SelectObject(memDc, oldObj); DeleteObject(hBmp); }
+                DeleteDC(memDc);
+                ReleaseDC(IntPtr.Zero, screenDc);
+            }
+        }
+    }
+
+    void DrawSkin(Graphics g)
+    {
         g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
         float k = S / 96f;
         using (var gp = Round(new Rectangle(0, 0, S - 1, S - 1), 11))
         using (var br = new SolidBrush(Brand))
@@ -643,7 +708,7 @@ class LauncherForm : Form
             SetBtn(it.Start, multi || n == 0, Accent, Color.White);
             SetBtn(it.Stop, n > 0, DangerBg, Danger);
         }
-        if (total != running) { running = total; Invalidate(); }
+        if (total != running) { running = total; UpdateSkin(); }
         tray.Text = total > 0 ? "启动器 · 运行中 " + total : "启动器";
     }
 
@@ -730,7 +795,9 @@ class LauncherForm : Form
         o2.Click += delegate { multi = !multi; Save(); Refresh_(); };
         var o3 = new ToolStripMenuItem("启动时检查更新") { Checked = autoUpdate };
         o3.Click += delegate { autoUpdate = !autoUpdate; Save(); };
-        trayMenu.Items.Add(o1); trayMenu.Items.Add(o2); trayMenu.Items.Add(o3);
+        var o4 = new ToolStripMenuItem("开机自启动") { Checked = IsAutoStart() };
+        o4.Click += delegate { SetAutoStart(!IsAutoStart()); };
+        trayMenu.Items.Add(o1); trayMenu.Items.Add(o2); trayMenu.Items.Add(o3); trayMenu.Items.Add(o4);
         trayMenu.Items.Add(new ToolStripSeparator());
 
         trayMenu.Items.Add("检查更新").Click += delegate { CheckUpdate(false); };
@@ -740,6 +807,36 @@ class LauncherForm : Form
         closeAll.Enabled = any;
         closeAll.Click += delegate { foreach (var it in items) Kill(it, false); };
         trayMenu.Items.Add("退出").Click += delegate { ExitApp(); };
+    }
+
+    // ================= 开机自启动（当前用户，写入注册表 Run） =================
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string RunName = "LoflaLauncher";
+
+    static bool IsAutoStart()
+    {
+        try
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
+                return k != null && k.GetValue(RunName) != null;
+        }
+        catch { return false; }
+    }
+
+    void SetAutoStart(bool on)
+    {
+        try
+        {
+            using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+            {
+                if (on) k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
+                else k.DeleteValue(RunName, false);
+            }
+        }
+        catch (Exception ex)
+        {
+            Msg("设置开机自启动失败：" + ex.Message, "开机自启动", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     void ExitApp()

@@ -15,7 +15,7 @@ using System.Windows.Forms;
 
 static class AppInfo
 {
-    public const string Version = "1.2.4";
+    public const string Version = "1.2.5";
     // GitHub 仓库，格式：用户名/仓库名
     public const string Repo = "lotusVienna/Launcher";
 }
@@ -248,7 +248,6 @@ class LauncherForm : Form
         tray = new NotifyIcon { Icon = Icon ?? SystemIcons.Application, Text = "启动器", Visible = true };
         trayMenu.Opening += delegate { BuildTrayMenu(); };
         tray.ContextMenuStrip = trayMenu;
-        ContextMenuStrip = trayMenu;      // 右键小方块 = 同一份菜单
         tray.MouseDoubleClick += delegate (object s, MouseEventArgs e)
         {
             if (e.Button == MouseButtons.Left) { shown = true; leaveTick = 0; ShowList(); }
@@ -494,10 +493,36 @@ class LauncherForm : Form
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+        if (e.Button == MouseButtons.Right) { ShowDockMenu(); return; }
         if (!pressed || e.Button != MouseButtons.Left) return;
         pressed = false;
         if (dragging) { dragging = false; SnapToEdge(); }
         else ToggleList();
+    }
+
+    // 右键菜单：和托盘同一份，但摆在小方块朝向屏幕内侧的一边，不盖住小方块
+    void ShowDockMenu()
+    {
+        popup.Hide();
+        BuildTrayMenu();
+        Size sz = trayMenu.GetPreferredSize(Size.Empty);
+        int w = sz.Width + 2, h = sz.Height + 2;
+        Rectangle d = Bounds;
+        var wa = Screen.FromPoint(new Point(d.Left + S / 2, d.Top + S / 2)).WorkingArea;
+        int x, y;
+        switch (edge)
+        {
+            case Edge.Left:
+                x = d.Right + 6; y = Clamp(d.Top, wa.Top, wa.Bottom - h); break;
+            case Edge.Right:
+                x = d.Left - w - 6; y = Clamp(d.Top, wa.Top, wa.Bottom - h); break;
+            case Edge.Top:
+                y = d.Bottom + 6; x = Clamp(d.Left, wa.Left, wa.Right - w); break;
+            default:
+                y = d.Top - h - 6; x = Clamp(d.Left, wa.Left, wa.Right - w); break;
+        }
+        shown = true; leaveTick = 0;
+        trayMenu.Show(new Point(x, y));
     }
 
     void SnapToEdge()

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -500,29 +500,41 @@ class LauncherForm : Form
         else ToggleList();
     }
 
-    // 右键菜单：和托盘同一份，但摆在小方块朝向屏幕内侧的一边，不盖住小方块
+    // 右键菜单：锚定在小方块朝屏幕内侧的边缘，确保菜单不会覆盖小方块
     void ShowDockMenu()
     {
         popup.Hide();
         BuildTrayMenu();
-        Size sz = trayMenu.GetPreferredSize(Size.Empty);
-        int w = sz.Width + 2, h = sz.Height + 2;
-        Rectangle d = Bounds;
-        var wa = Screen.FromPoint(new Point(d.Left + S / 2, d.Top + S / 2)).WorkingArea;
-        int x, y;
+
+        shown = true;
+        leaveTick = 0;
+
+        // 使用控件锚点和明确弹出方向，避免屏幕坐标定位造成菜单压住小方块。
+        // 贴右边：向左弹；贴左边：向右弹；贴顶部：向下弹；贴底部：向上弹。
+        Point anchor;
+        ToolStripDropDownDirection direction;
+
         switch (edge)
         {
             case Edge.Left:
-                x = d.Right + 6; y = Clamp(d.Top, wa.Top, wa.Bottom - h); break;
+                anchor = new Point(S, 0);
+                direction = ToolStripDropDownDirection.Right;
+                break;
             case Edge.Right:
-                x = d.Left - w - 6; y = Clamp(d.Top, wa.Top, wa.Bottom - h); break;
+                anchor = new Point(0, 0);
+                direction = ToolStripDropDownDirection.Left;
+                break;
             case Edge.Top:
-                y = d.Bottom + 6; x = Clamp(d.Left, wa.Left, wa.Right - w); break;
-            default:
-                y = d.Top - h - 6; x = Clamp(d.Left, wa.Left, wa.Right - w); break;
+                anchor = new Point(0, S);
+                direction = ToolStripDropDownDirection.Below;
+                break;
+            default: // Edge.Bottom
+                anchor = new Point(0, 0);
+                direction = ToolStripDropDownDirection.Above;
+                break;
         }
-        shown = true; leaveTick = 0;
-        trayMenu.Show(new Point(x, y));
+
+        trayMenu.Show(this, anchor, direction);
     }
 
     void SnapToEdge()

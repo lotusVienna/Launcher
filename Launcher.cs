@@ -15,7 +15,7 @@ using System.Windows.Forms;
 
 static class AppInfo
 {
-    public const string Version = "1.2.1";
+    public const string Version = "1.2.2";
     // GitHub 仓库，格式：用户名/仓库名
     public const string Repo = "lotusVienna/Launcher";
 }
@@ -25,10 +25,17 @@ enum Edge { Left, Right, Top, Bottom }
 class Item
 {
     public string Name, Path;
+    public bool Admin;                                   // 以管理员身份运行
     public List<Process> Procs = new List<Process>();   // 同一项可同时运行多个实例
     public Panel Row;
     public Label Dot, NameLbl;
     public Button Start, Stop;
+
+    // 提权进程的句柄有时读不到退出状态，改按进程号确认是否还在
+    static bool Alive(Process p)
+    {
+        try { Process.GetProcessById(p.Id); return true; } catch { return false; }
+    }
 
     public int Count
     {
@@ -37,7 +44,7 @@ class Item
             for (int i = Procs.Count - 1; i >= 0; i--)
             {
                 bool dead;
-                try { dead = Procs[i].HasExited; } catch { dead = true; }
+                try { dead = Procs[i].HasExited; } catch { dead = !Alive(Procs[i]); }
                 if (dead) Procs.RemoveAt(i);
             }
             return Procs.Count;
@@ -582,7 +589,14 @@ class LauncherForm : Form
                 continue;
             }
             int i = line.IndexOf('|');
-            if (i > 0) AddItem(line.Substring(0, i), line.Substring(i + 1));
+            if (i > 0)
+            {
+                string rest = line.Substring(i + 1);
+                bool adm = false;
+                if (rest.EndsWith("|admin", StringComparison.Ordinal))
+                { adm = true; rest = rest.Substring(0, rest.Length - 6); }
+                AddItem(line.Substring(0, i), rest, adm);
+            }
         }
     }
 
@@ -595,7 +609,7 @@ class LauncherForm : Form
         sb.AppendLine("#autoupdate=" + (autoUpdate ? "1" : "0"));
         sb.AppendLine("#edge=" + edge.ToString().ToLowerInvariant());
         sb.AppendLine("#pos=" + ax + "," + ay);
-        foreach (var it in items) sb.AppendLine(it.Name + "|" + it.Path);
+        foreach (var it in items) sb.AppendLine(it.Name + "|" + it.Path + (it.Admin ? "|admin" : ""));
         Directory.CreateDirectory(Dir);
         File.WriteAllText(Cfg, sb.ToString(), new UTF8Encoding(false));
     }
@@ -621,9 +635,9 @@ class LauncherForm : Form
         b.Cursor = on ? Cursors.Hand : Cursors.Default;
     }
 
-    void AddItem(string name, string path)
+    void AddItem(string name, string path, bool admin = false)
     {
-        var it = new Item { Name = name, Path = path };
+        var it = new Item { Name = name, Path = path, Admin = admin };
 
         it.Row = new Panel { Height = 32, BackColor = Color.White };
         it.Dot = new Label
@@ -646,6 +660,10 @@ class LauncherForm : Form
         menu.Opened += delegate { menuOpen++; };
         menu.Closed += delegate { if (menuOpen > 0) menuOpen--; };
         menu.Items.Add("重命名").Click += delegate { Rename(it); };
+        var adminMi = new ToolStripMenuItem("以管理员身份运行");
+        adminMi.Click += delegate { it.Admin = !it.Admin; Save(); Refresh_(); };
+        menu.Opening += delegate { adminMi.Checked = it.Admin; };
+        menu.Items.Add(adminMi);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("关闭最近启动的一个").Click += delegate { Kill(it, true); };
         menu.Items.Add("关闭全部").Click += delegate { Kill(it, false); };
@@ -702,7 +720,7 @@ class LauncherForm : Form
         {
             int n = it.Count;
             total += n;
-            it.NameLbl.Text = it.Name + (n > 1 ? "  ×" + n : "");
+            it.NameLbl.Text = it.Name + (it.Admin ? "（管理员）" : "") + (n > 1 ? "  ×" + n : "");
             it.Dot.ForeColor = n > 0 ? Green : OffFg;
             it.NameLbl.ForeColor = n > 0 ? Green : SystemColors.ControlText;
             SetBtn(it.Start, multi || n == 0, Accent, Color.White);
@@ -722,6 +740,7 @@ class LauncherForm : Form
             string ext = System.IO.Path.GetExtension(it.Path).ToLowerInvariant();
             psi.WorkingDirectory = System.IO.Path.GetDirectoryName(it.Path);
             psi.UseShellExecute = true;
+            if (it.Admin) psi.Verb = "runas";      // 弹出 UAC 确认
             if (ext == ".ps1")
             {
                 psi.FileName = "powershell.exe";
@@ -737,6 +756,11 @@ class LauncherForm : Form
             var p = Process.Start(psi);
             if (p != null) it.Procs.Add(p);
         }
+        catch (System.ComponentModel.Win32Exception wex)
+        {
+            if (wex.NativeErrorCode != 1223)      // 1223 = 用户在 UAC 里点了“否”，不用提示
+                Msg(wex.Message, "启动失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
         catch (Exception ex) { Msg(ex.Message, "启动失败", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         Refresh_();
     }
@@ -747,16 +771,34 @@ class LauncherForm : Form
         var targets = new List<Process>();
         if (lastOnly) targets.Add(it.Procs[it.Procs.Count - 1]);
         else targets.AddRange(it.Procs);
-        foreach (var p in targets)
+        if (it.Admin)
         {
+            // 提权进程只有提权的 taskkill 才结束得了：把所有进程号合并成一次，只弹一次 UAC
+            var args = new StringBuilder();
+            foreach (var p in targets) args.Append("/PID " + p.Id + " ");
+            args.Append("/T /F");
             try
             {
-                // 连同子进程（如 ssh）一起结束
-                var k = Process.Start(new ProcessStartInfo("taskkill", "/PID " + p.Id + " /T /F")
-                    { CreateNoWindow = true, UseShellExecute = false });
-                k.WaitForExit(3000);
+                var k = Process.Start(new ProcessStartInfo("taskkill", args.ToString())
+                    { Verb = "runas", UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden });
+                if (k != null) k.WaitForExit(5000);
             }
-            catch { try { p.Kill(); } catch { } }
+            catch (System.ComponentModel.Win32Exception) { }   // 用户取消了 UAC，保持运行状态
+            catch { }
+        }
+        else
+        {
+            foreach (var p in targets)
+            {
+                try
+                {
+                    // 连同子进程（如 ssh）一起结束
+                    var k = Process.Start(new ProcessStartInfo("taskkill", "/PID " + p.Id + " /T /F")
+                        { CreateNoWindow = true, UseShellExecute = false });
+                    k.WaitForExit(3000);
+                }
+                catch { try { p.Kill(); } catch { } }
+            }
         }
         Refresh_();
     }
@@ -779,7 +821,7 @@ class LauncherForm : Form
             var it = item;
             int n = it.Count;
             if (n > 0) any = true;
-            var mi = trayMenu.Items.Add((n > 0 ? "● " : "○ ") + it.Name + (n > 1 ? "  ×" + n : ""));
+            var mi = trayMenu.Items.Add((n > 0 ? "● " : "○ ") + it.Name + (it.Admin ? "（管理员）" : "") + (n > 1 ? "  ×" + n : ""));
             mi.ToolTipText = it.Path;
             mi.Enabled = multi || n == 0;
             mi.Click += delegate { Run(it); };
@@ -1031,7 +1073,7 @@ class LauncherForm : Form
         {
             var f = new Form
             {
-                Text = "添加", Size = new Size(460, 160), FormBorderStyle = FormBorderStyle.FixedDialog,
+                Text = "添加", Size = new Size(460, 200), FormBorderStyle = FormBorderStyle.FixedDialog,
                 StartPosition = FormStartPosition.CenterScreen, MaximizeBox = false, MinimizeBox = false,
                 ShowInTaskbar = false, TopMost = true
             };
@@ -1041,8 +1083,9 @@ class LauncherForm : Form
             var l2 = new Label { Text = "路径", Left = 12, Top = 50, Width = 40 };
             var p = new TextBox { Left = 56, Top = 46, Width = 300 };
             var b = new Button { Text = "浏览", Left = 362, Top = 44, Width = 64 };
-            var ok = new Button { Text = "确定", Left = 270, Top = 84, Width = 76, DialogResult = DialogResult.OK };
-            var cancel = new Button { Text = "取消", Left = 350, Top = 84, Width = 76, DialogResult = DialogResult.Cancel };
+            var adm = new CheckBox { Text = "以管理员身份运行（启动时会弹出 UAC 确认）", Left = 56, Top = 80, Width = 370 };
+            var ok = new Button { Text = "确定", Left = 270, Top = 122, Width = 76, DialogResult = DialogResult.OK };
+            var cancel = new Button { Text = "取消", Left = 350, Top = 122, Width = 76, DialogResult = DialogResult.Cancel };
             b.Click += delegate
             {
                 var d = new OpenFileDialog { Filter = "脚本/程序|*.ps1;*.bat;*.cmd;*.exe|所有文件|*.*" };
@@ -1053,12 +1096,12 @@ class LauncherForm : Form
                 }
             };
             f.AcceptButton = ok; f.CancelButton = cancel;
-            f.Controls.AddRange(new Control[] { l1, n, l2, p, b, ok, cancel });
+            f.Controls.AddRange(new Control[] { l1, n, l2, p, b, adm, ok, cancel });
             if (f.ShowDialog() == DialogResult.OK && p.Text.Trim().Length > 0)
             {
                 string name = n.Text.Trim().Length > 0 ? n.Text.Trim().Replace("|", " ")
                             : System.IO.Path.GetFileNameWithoutExtension(p.Text.Trim());
-                AddItem(name, p.Text.Trim().Trim(new char[] { '"' }));
+                AddItem(name, p.Text.Trim().Trim(new char[] { '"' }), adm.Checked);
                 Save();
                 ResizePopup();
             }

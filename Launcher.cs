@@ -15,7 +15,7 @@ using System.Windows.Forms;
 
 static class AppInfo
 {
-    public const string Version = "1.2.2";
+    public const string Version = "1.2.4";
     // GitHub 仓库，格式：用户名/仓库名
     public const string Repo = "lotusVienna/Launcher";
 }
@@ -436,8 +436,13 @@ class LauncherForm : Form
     void Tick_()
     {
         if (++statusTick >= 32) { statusTick = 0; Refresh_(); }
-        if (!Visible || dragging) return;
         Point c = Cursor.Position;
+
+        // 右键菜单：小方块不抢焦点，系统不会替我们处理“点空白处关闭”，这里自己判断
+        if (trayMenu.Visible && Control.MouseButtons != MouseButtons.None && !trayMenu.Bounds.Contains(c))
+            trayMenu.Close();
+
+        if (!Visible || dragging) return;
 
         // 点击列表和小方块之外：收起列表
         if (popup.Visible && !busy && menuOpen == 0 && !trayMenu.Visible && Control.MouseButtons != MouseButtons.None)
@@ -659,7 +664,7 @@ class LauncherForm : Form
         var menu = new ContextMenuStrip();
         menu.Opened += delegate { menuOpen++; };
         menu.Closed += delegate { if (menuOpen > 0) menuOpen--; };
-        menu.Items.Add("重命名").Click += delegate { Rename(it); };
+        menu.Items.Add("编辑（名称 / 路径）…").Click += delegate { EditItem(it); };
         var adminMi = new ToolStripMenuItem("以管理员身份运行");
         adminMi.Click += delegate { it.Admin = !it.Admin; Save(); Refresh_(); };
         menu.Opening += delegate { adminMi.Checked = it.Admin; };
@@ -686,15 +691,47 @@ class LauncherForm : Form
         Refresh_();
     }
 
-    void Rename(Item it)
+    // 编辑：名称、路径、是否管理员，一个对话框里改完
+    void EditItem(Item it)
     {
-        string nn = Prompt("重命名", "新名称", it.Name);
-        if (nn == null) return;
-        nn = nn.Trim().Replace("|", " ");
-        if (nn.Length == 0 || nn == it.Name) return;
-        it.Name = nn;
-        Save();
-        Refresh_();
+        busy = true;
+        try
+        {
+            var f = new Form
+            {
+                Text = "编辑", Size = new Size(460, 200), FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterScreen, MaximizeBox = false, MinimizeBox = false,
+                ShowInTaskbar = false, TopMost = true
+            };
+            f.Font = new Font("Microsoft YaHei UI", 9f);
+            var l1 = new Label { Text = "名称", Left = 12, Top = 16, Width = 40 };
+            var n = new TextBox { Left = 56, Top = 12, Width = 370, Text = it.Name };
+            var l2 = new Label { Text = "路径", Left = 12, Top = 50, Width = 40 };
+            var p = new TextBox { Left = 56, Top = 46, Width = 300, Text = it.Path };
+            var b = new Button { Text = "浏览", Left = 362, Top = 44, Width = 64 };
+            var adm = new CheckBox { Text = "以管理员身份运行（启动时会弹出 UAC 确认）", Left = 56, Top = 80, Width = 370, Checked = it.Admin };
+            var ok = new Button { Text = "确定", Left = 270, Top = 122, Width = 76, DialogResult = DialogResult.OK };
+            var cancel = new Button { Text = "取消", Left = 350, Top = 122, Width = 76, DialogResult = DialogResult.Cancel };
+            b.Click += delegate
+            {
+                var d = new OpenFileDialog { Filter = "脚本/程序|*.ps1;*.bat;*.cmd;*.exe|所有文件|*.*" };
+                try { string cur = System.IO.Path.GetDirectoryName(p.Text.Trim().Trim(new char[] { '"' })); if (Directory.Exists(cur)) d.InitialDirectory = cur; } catch { }
+                if (d.ShowDialog() == DialogResult.OK) p.Text = d.FileName;
+            };
+            f.AcceptButton = ok; f.CancelButton = cancel;
+            f.Controls.AddRange(new Control[] { l1, n, l2, p, b, adm, ok, cancel });
+            if (f.ShowDialog() != DialogResult.OK) return;
+
+            string path = p.Text.Trim().Trim(new char[] { '"' });
+            if (path.Length == 0) return;
+            string name = n.Text.Trim().Replace("|", " ");
+            if (name.Length == 0) name = System.IO.Path.GetFileNameWithoutExtension(path);
+            it.Name = name; it.Path = path; it.Admin = adm.Checked;
+            tip.SetToolTip(it.NameLbl, path + "\n（双击启动，右键更多）");
+            Save();
+            Refresh_();
+        }
+        finally { busy = false; }
     }
 
     void Layout_()
